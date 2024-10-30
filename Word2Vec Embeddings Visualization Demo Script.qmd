@@ -1,0 +1,214 @@
+---
+title: "Word2Vec Embeddings Visualization"
+format: html
+editor: visual
+---
+
+```{r}
+# load required packages
+if (!requireNamespace('shiny', quietly = TRUE)) install.packages('shiny')
+if (!requireNamespace('plotly', quietly = TRUE)) install.packages('plotly')
+if (!requireNamespace('word2vec', quietly = TRUE)) install.packages('word2vec')
+if (!requireNamespace('udpipe', quietly = TRUE)) install.packages('udpipe')
+if (!requireNamespace('factoextra', quietly = TRUE)) install.packages('factoextra')
+if (!requireNamespace('viridis', quietly = TRUE)) install.packages('viridis')
+if (!requireNamespace('DT', quietly = TRUE)) install.packages('DT')
+if (!requireNamespace('tm', quietly = TRUE)) install.packages('tm')
+
+library(shiny)
+library(plotly)
+library(word2vec)
+library(udpipe)
+library(factoextra)
+library(viridis)
+library(DT)
+library(tm)
+
+## load and preprocess the sample data
+data(brussels_reviews, package = "udpipe")
+x <- subset(brussels_reviews, language == "nl")
+
+# clean the text data
+x$feedback <- tolower(x$feedback)  # convert text to lowercase
+x$feedback <- removeNumbers(x$feedback)  # remove numbers
+x$feedback <- removePunctuation(x$feedback)  # remove punctuation
+x$feedback <- removeWords(x$feedback, stopwords("dutch"))  # remove stopwords
+
+## train word2vec model on the cleaned data
+model <- word2vec::word2vec(
+  x = x$feedback, 
+  dim = 15, 
+  iter = 20, 
+  type = 'skip-gram', 
+  window = 5, 
+  min_count = 1
+)
+
+# extract word embeddings
+embeddings <- as.matrix(model)
+words <- rownames(embeddings)
+
+# calculate word frequencies from the cleaned data
+word_list <- unlist(strsplit(x$feedback, "\\s+"))
+word_freq <- table(word_list)
+
+## create the Shiny app
+ui <- fluidPage(
+  titlePanel("3D Word Embeddings Clustering"),
+  sidebarLayout(
+    sidebarPanel(
+      sliderInput("num_clusters", "Number of Clusters:", 
+                  min = 2, max = 10, value = 5, step = 1, 
+                  width = '100%'),
+      plotOutput("elbowPlot", height = "300px", width = "100%"),
+      selectInput("selected_cluster", "Select Cluster to Highlight:", 
+                  choices = 1:10, selected = "None", width = '100%'),
+      actionButton("word_analysis", "Word-Level Analysis", 
+                   title = "Open word analysis settings", 
+                   class = "btn-primary", width = '100%'),
+      br(), br()
+    ),
+    mainPanel(
+      plotlyOutput("plot3d", height = "600px", width = "100%")
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  # dynamically update cluster choices based on the number of clusters
+  observe({
+    choices <- c("All", 1:input$num_clusters)
+    updateSelectInput(session, "selected_cluster", choices = c("None", 1:input$num_clusters))
+  })
+  
+  # render the elbow plot
+  output$elbowPlot <- renderPlot({
+    set.seed(42)
+    wss <- sapply(1:10, function(k) {
+      kmeans(embeddings, centers = k, nstart = 25)$tot.withinss
+    })
+    fviz_nbclust(
+      embeddings, 
+      kmeans, 
+      method = "wss", 
+      k.max = 10
+    ) +
+      geom_vline(xintercept = input$num_clusters, linetype = "dashed", color = "red") +
+      ggtitle("Elbow Plot for Optimal Clusters") +
+      theme_minimal() +
+      theme(plot.title = element_text(size = 14, face = "bold"),
+            axis.title = element_text(size = 12))
+  })
+  
+  # render the 3D clustering plot
+  output$plot3d <- renderPlotly({
+    # perform k-means clustering
+    set.seed(42)
+    kmeans_result <- kmeans(embeddings, centers = input$num_clusters, nstart = 25)
+    
+    # prepare data for plotting
+    emb_df <- data.frame(embeddings)
+    emb_df$word <- words
+    emb_df$cluster <- as.factor(kmeans_result$cluster)
+    
+    # reduce to 3D using PCA
+    pca_result <- prcomp(embeddings, center = TRUE, scale. = TRUE)
+    pca_3d <- pca_result$x[, 1:3]
+    pca_df <- data.frame(pca_3d, word = words, cluster = emb_df$cluster)
+    
+    # determine colors and opacity
+    if (input$selected_cluster == "None") {
+      pca_df$color <- pca_df$cluster
+      pca_df$opacity <- 1
+      pca_df$legend_label <- pca_df$cluster
+    } else {
+      pca_df$color <- ifelse(pca_df$cluster == input$selected_cluster, "orange", viridis(input$num_clusters)[as.integer(pca_df$cluster)])
+      pca_df$opacity <- ifelse(pca_df$cluster == input$selected_cluster, 1, 0.1)
+      pca_df$legend_label <- ifelse(pca_df$cluster == input$selected_cluster, 
+                                    as.character(input$selected_cluster), 
+                                    "Others")
+    }
+    
+    # plot the 3D scatter plot
+    plot_ly(
+      data = pca_df, 
+      x = ~PC1, y = ~PC2, z = ~PC3, 
+      color = ~legend_label, 
+      colors = c(viridis(input$num_clusters), "orange", "gray"),
+      text = ~word, type = 'scatter3d', mode = 'markers',
+      marker = list(opacity = ~opacity, size = 5)
+    ) %>%
+      layout(
+        scene = list(
+          xaxis = list(title = 'PC1'),
+          yaxis = list(title = 'PC2'),
+          zaxis = list(title = 'PC3')
+        ),
+        title = '3D Word Embeddings Clustering'
+      )
+  })
+  
+  # display word-level analysis settings in a modal
+  observeEvent(input$word_analysis, {
+    showModal(modalDialog(
+      title = "Word-Level Analysis Settings",
+      selectInput("drilldown_cluster", "Select Cluster for Drill-Down:", 
+                  choices = c("All", 1:input$num_clusters), selected = "All"),
+      actionButton("apply_word_analysis", "Apply", class = "btn-success"),
+      easyClose = TRUE,
+      footer = modalButton("Close")
+    ))
+  })
+  
+  # apply word-level analysis based on user input
+  observeEvent(input$apply_word_analysis, {
+    req(input$drilldown_cluster)
+    selected_cluster <- input$drilldown_cluster
+    
+    # filter words based on cluster selection
+    kmeans_result <- kmeans(embeddings, centers = input$num_clusters, nstart = 25)
+    if (selected_cluster == "All") {
+      cluster_words <- words
+      cluster_assignment <- kmeans_result$cluster
+    } else {
+      selected_cluster <- as.integer(selected_cluster)
+      cluster_words <- words[kmeans_result$cluster == selected_cluster]
+      cluster_assignment <- kmeans_result$cluster[kmeans_result$cluster == selected_cluster]
+    }
+    
+    # filter word frequencies
+    selected_word_freq <- word_freq[names(word_freq) %in% cluster_words]
+    selected_word_freq <- sort(selected_word_freq, decreasing = TRUE)
+    
+    # prepare the top words table
+    top_words_df <- data.frame(
+      Word = names(selected_word_freq),
+      Frequency = as.integer(selected_word_freq),
+      Cluster = cluster_assignment[match(names(selected_word_freq), cluster_words)],
+      stringsAsFactors = FALSE
+    )
+    
+    # display top words in a modal
+    showModal(modalDialog(
+      title = "Top Words in Selected Cluster",
+      DTOutput("topWordsTable"),
+      easyClose = TRUE,
+      size = "l",
+      footer = modalButton("Close")
+    ))
+    
+    output$topWordsTable <- renderDT({
+      datatable(
+        top_words_df,
+        selection = 'single',
+        options = list(pageLength = 10, autoWidth = TRUE, order = list(list(1, 'desc'))),
+        rownames = FALSE
+      )
+    })
+  })
+}
+
+# launch the Shiny app
+shinyApp(ui = ui, server = server)
+```
